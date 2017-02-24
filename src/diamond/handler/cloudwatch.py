@@ -12,36 +12,42 @@ Automatically adds the InstanceId Dimension
 
 Enable this handler
 
- * handers = diamond.handler.cloudwatch.cloudwatchHandler
+ * handlers = diamond.handler.cloudwatch.cloudwatchHandler
 
 Example Config:
 
 [[cloudwatchHandler]]
 region = us-east-1
+no_instance_id = False
+
+# See http://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch_concepts.html
+[[[dimensions]]]
+environment = production
+group = api
+role = worker
 
 [[[LoadAvg01]]]
-collect_by_instance = True
-collect_without_dimension = False
 collector = loadavg
 metric = 01
-name = Avg01
 namespace = MachineLoad
+name = Avg01
 unit = None
 
+
 [[[LoadAvg05]]]
-collect_by_instance = True
-collect_without_dimension = False
 collector = loadavg
 metric = 05
-name = Avg05
 namespace = MachineLoad
+name = Avg05
 unit = None
+
 """
 
 import sys
 import datetime
 
-from Handler import Handler
+from diamond.handler.Handler import Handler
+from diamond.utils.config import str_to_bool
 from configobj import Section
 
 try:
@@ -77,23 +83,35 @@ class cloudwatchHandler(Handler):
         # Initialize Options
         self.region = self.config['region']
 
-        instance_metadata = boto.utils.get_instance_metadata()
-        if 'instance-id' in instance_metadata:
-            self.instance_id = instance_metadata['instance-id']
-            self.log.debug("Setting InstanceId: " + self.instance_id)
-        else:
-            self.instance_id = None
+        self.dimensions = self.config.get('dimensions', {})
+        if self.dimensions.__class__ is not Section:
+            self.log.error("dimensions must be a sub-section!")
+            return
+
+        instances = boto.utils.get_instance_metadata()
+        if 'instance-id' not in instances:
             self.log.error('CloudWatch: Failed to load instance metadata')
+            return
+        self.instance_id = instances['instance-id']
+
+        # For backward compatibility: set the InstanceId dimension if not no_instance_id
+        if not str_to_bool(self.config.get('no_instance_id', False)):
+            self.log.debug("Setting InstanceId: " + self.instance_id)
+            self.dimensions.update(InstanceId=self.instance_id)
 
         self.valid_config = ('region', 'collector', 'metric', 'namespace',
-                             'name', 'unit', 'collect_by_instance',
-                             'collect_without_dimension')
-
+                             'name', 'unit', 'dimensions')
         self.rules = []
         for key_name, section in self.config.items():
+
             if section.__class__ is Section:
+
+                # skips the global [dimensions] section.
+                if section.name == 'dimensions':
+                    continue
+
                 keys = section.keys()
-                rules = self.get_default_rule_config()
+                rules = {}
                 for key in keys:
                     if key not in self.valid_config:
                         self.log.warning("invalid key %s in section %s",
@@ -101,26 +119,26 @@ class cloudwatchHandler(Handler):
                     else:
                         rules[key] = section[key]
 
+                        if key == 'dimensions':
+                            if rules[key].__class__ is not Section:
+                                self.log.error("dimensions must be a sub-section!")
+                                return
+
+                # initialize per-rule [dimensions], which "inherits" from the global [dimensions].
+                dim = self.dimensions.copy()
+                dim.update(rules.get('dimensions', {}))
+                rules['dimensions'] = dim
+
+                rules['collector'] = str(rules['collector'])
+                rules['metric'] = str(rules['metric'])
+                rules['namespace'] = str(rules.get('namespace', ''))
+                rules['name'] = str(rules.get('name', section.name))
+                rules['unit'] = str(rules.get('unit', 'None'))
+
                 self.rules.append(rules)
 
         # Create CloudWatch Connection
         self._bind()
-
-    def get_default_rule_config(self):
-        """
-        Return the default config for a rule
-        """
-        config = {}
-        config.update({
-            'collector': '',
-            'metric': '',
-            'namespace': '',
-            'name': '',
-            'unit': 'None',
-            'collect_by_instance': True,
-            'collect_without_dimension': False
-        })
-        return config
 
     def get_default_config_help(self):
         """
@@ -129,14 +147,12 @@ class cloudwatchHandler(Handler):
         config = super(cloudwatchHandler, self).get_default_config_help()
 
         config.update({
-            'region': 'AWS region',
-            'metric': 'Diamond metric name',
-            'namespace': 'CloudWatch metric namespace',
-            'name': 'CloudWatch metric name',
-            'unit': 'CloudWatch metric unit',
-            'collector': 'Diamond collector name',
-            'collect_by_instance': 'Collect metrics for instances separately',
-            'collect_without_dimension': 'Collect metrics without dimension'
+            'region': '',
+            'metric': '',
+            'namespace': '',
+            'name': '',
+            'unit': '',
+            'collector': '',
         })
 
         return config
@@ -154,8 +170,6 @@ class cloudwatchHandler(Handler):
             'namespace': 'MachineLoad',
             'name': 'Avg01',
             'unit': 'None',
-            'collect_by_instance': True,
-            'collect_without_dimension': False
         })
 
         return config
@@ -195,71 +209,37 @@ class cloudwatchHandler(Handler):
 
         collector = str(metric.getCollectorPath())
         metricname = str(metric.getMetricPath())
+        timestamp = datetime.datetime.utcfromtimestamp(metric.timestamp)
 
         # Send the data as ......
 
         for rule in self.rules:
+            data = (
+                rule['namespace'], rule['name'],
+                metric.value, timestamp,
+                rule['unit'], rule['dimensions']
+            )
             self.log.debug(
                 "Comparing Collector: [%s] with (%s) "
                 "and Metric: [%s] with (%s)",
-                str(rule['collector']),
-                collector,
-                str(rule['metric']),
-                metricname
+                rule['collector'], collector, rule['metric'], metricname
             )
-
-            if ((str(rule['collector']) == collector and
-                 str(rule['metric']) == metricname)):
-
-                if rule['collect_by_instance'] and self.instance_id:
-                    self.send_metrics_to_cloudwatch(
-                        rule,
-                        metric,
-                        {'InstanceId': self.instance_id})
-
-                if rule['collect_without_dimension']:
-                    self.send_metrics_to_cloudwatch(
-                        rule,
-                        metric,
-                        {})
-
-    def send_metrics_to_cloudwatch(self, rule, metric, dimensions):
-        """
-          Send metrics to CloudWatch for the given dimensions
-        """
-
-        timestamp = datetime.datetime.fromtimestamp(metric.timestamp)
-
-        self.log.debug(
-            "CloudWatch: Attempting to publish metric: %s to %s "
-            "with value (%s) for dimensions %s @%s",
-            rule['name'],
-            rule['namespace'],
-            str(metric.value),
-            str(dimensions),
-            str(metric.timestamp)
-        )
-
-        try:
-            self.connection.put_metric_data(
-                str(rule['namespace']),
-                str(rule['name']),
-                str(metric.value),
-                timestamp, str(rule['unit']),
-                dimensions)
-            self.log.debug(
-                "CloudWatch: Successfully published metric: %s to"
-                " %s with value (%s) for dimensions %s",
-                rule['name'],
-                rule['namespace'],
-                str(metric.value),
-                str(dimensions))
-        except AttributeError, e:
-            self.log.error(
-                "CloudWatch: Failed publishing - %s ", str(e))
-        except Exception, e:  # Rough connection re-try logic.
-            self.log.error(
-                "CloudWatch: Failed publishing - %s\n%s ",
-                str(e),
-                str(sys.exc_info()[0]))
-            self._bind()
+            if rule['collector'] == collector and rule['metric'] == metricname:
+                self.log.debug(
+                    "CloudWatch: Attempting to publish to %s, metric: %s "
+                    "with value (%s) unit: (%s) @%s and dimensions: %s" % data
+                )
+                try:
+                    self.connection.put_metric_data(*data)
+                    self.log.debug(
+                        "CloudWatch: Successfully published to %s, metric: %s"
+                        "with value (%s), unit: (%s) @%s and dimensions: %s" % data
+                    )
+                except AttributeError, e:
+                    self.log.error(
+                        "CloudWatch: Failed publishing - %s ", str(e))
+                except Exception:  # Rough connection re-try logic.
+                    self.log.error(
+                        "CloudWatch: Failed publishing - %s ",
+                        str(sys.exc_info()[0]))
+                    self._bind()
